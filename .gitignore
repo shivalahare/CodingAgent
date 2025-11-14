@@ -1,0 +1,7 @@
+.env
+.venv
+venv
+demo
+agent.log
+bug_report.md
+*.code-workspace
