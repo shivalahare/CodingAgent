@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 # -------------------- Environment Setup --------------------
 load_dotenv()
 
-
 # -------------------- Logging Setup --------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +40,12 @@ class Tool(BaseModel):
 # -------------------- AI Agent --------------------
 class AIAgent:
     def __init__(self, api_key: str):
-        self.client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+        # ✔ HuggingFace Inference Router endpoint
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://router.huggingface.co/v1"
+        )
+
         self.messages: List[Dict[str, Any]] = []
         self.tools: List[Tool] = []
         self._setup_tools()
@@ -169,7 +173,7 @@ class AIAgent:
                         },
                         "file_extension": {
                             "type": "string",
-                            "description": "Filter by file extension (e.g., '.txt', '.py')",
+                            "description": "Filter by file extension",
                         }
                     },
                     "required": ["directory", "search_text"],
@@ -181,8 +185,7 @@ class AIAgent:
     def _read_file(self, path: str) -> str:
         try:
             with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return f"File contents of {path}:\n{content}"
+                return f"File contents of {path}:\n{f.read()}"
         except FileNotFoundError:
             return f"File not found: {path}"
         except Exception as e:
@@ -195,11 +198,10 @@ class AIAgent:
 
             items = []
             for item in sorted(os.listdir(path)):
-                item_path = os.path.join(path, item)
-                prefix = "[DIR]" if os.path.isdir(item_path) else "[FILE]"
+                prefix = "[DIR]" if os.path.isdir(os.path.join(path, item)) else "[FILE]"
                 items.append(f"{prefix} {item}")
 
-            return f"Contents of {path}:\n" + "\n".join(items) if items else f"Empty directory: {path}"
+            return f"Contents of {path}:\n" + "\n".join(items)
         except Exception as e:
             return f"Error listing files: {str(e)}"
 
@@ -214,9 +216,7 @@ class AIAgent:
 
                 content = content.replace(old_text, new_text)
             else:
-                dir_name = os.path.dirname(path)
-                if dir_name:
-                    os.makedirs(dir_name, exist_ok=True)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
                 content = new_text
 
             with open(path, "w", encoding="utf-8") as f:
@@ -235,12 +235,13 @@ class AIAgent:
                 return self._list_files(tool_input.get("path", "."))
             elif tool_name == "edit_file":
                 return self._edit_file(
-                    tool_input["path"], tool_input.get("old_text", ""), tool_input["new_text"]
+                    tool_input["path"],
+                    tool_input.get("old_text", ""),
+                    tool_input["new_text"],
                 )
             else:
                 return f"Unknown tool: {tool_name}"
         except Exception as e:
-            logging.error(f"Error executing {tool_name}: {str(e)}")
             return f"Error executing {tool_name}: {str(e)}"
 
     # -------------------- Chat Loop --------------------
@@ -263,7 +264,8 @@ class AIAgent:
         while True:
             try:
                 response = self.client.chat.completions.create(
-                    model="deepseek/deepseek-chat-v3.1:free",
+                    # ✔ HuggingFace-supported model
+                    model="deepseek-ai/DeepSeek-V3.2-Exp:novita",
                     messages=self.messages,
                     tools=tools,
                     tool_choice="auto",
@@ -273,27 +275,24 @@ class AIAgent:
                 message = response.choices[0].message
                 self.messages.append(message)
 
-                # Handle tool calls if any
+                # Tool call?
                 if message.tool_calls:
                     tool_results = []
                     for call in message.tool_calls:
                         name = call.function.name
                         args = json.loads(call.function.arguments)
                         result = self._execute_tool(name, args)
-                        tool_results.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call.id,
-                                "content": result,
-                            }
-                        )
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result,
+                        })
 
-                    # Feed tool results back to the model
                     self.messages.extend(tool_results)
-                    continue  # continue the loop until no more tool calls
-                else:
-                    reply = message.content or ""
-                    return reply
+                    continue
+
+                return message.content or ""
+
             except Exception as e:
                 return f"Error: {str(e)}"
 
@@ -301,23 +300,22 @@ class AIAgent:
 # -------------------- CLI --------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="AI Code Assistant (OpenRouter) - Conversational agent with file tools"
+        description="AI Code Assistant (HuggingFace Router)"
     )
     parser.add_argument(
-        "--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY environment variable)"
+        "--api-key", help="HF_TOKEN (or set HF_TOKEN environment variable)"
     )
     args = parser.parse_args()
 
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
+    api_key = args.api_key or os.getenv("HF_TOKEN")
     if not api_key:
-        print("Error: Please provide an API key via --api-key or OPENROUTER_API_KEY environment variable")
+        print("Error: please pass --api-key or set HF_TOKEN environment variable")
         sys.exit(1)
 
     agent = AIAgent(api_key)
 
-    print("AI Code Assistant (OpenRouter)")
-    print("==============================")
-    print("A conversational AI agent that can read, list, and edit files.")
+    print("AI Code Assistant (HuggingFace Router)")
+    print("=====================================")
     print("Type 'exit' or 'quit' to end.\n")
 
     while True:
@@ -326,18 +324,20 @@ def main():
             if user_input.lower() in ["exit", "quit"]:
                 print("Goodbye!")
                 break
+
             if not user_input:
                 continue
+
             print("\nAssistant: ", end="", flush=True)
             response = agent.chat(user_input)
             print(response)
             print()
+
         except KeyboardInterrupt:
             print("\nGoodbye!")
             break
         except Exception as e:
-            print(f"\nError: {str(e)}")
-            print()
+            print(f"\nError: {str(e)}\n")
 
 
 if __name__ == "__main__":
