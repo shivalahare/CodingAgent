@@ -3,6 +3,7 @@
 # dependencies = [
 #     "openai",
 #     "pydantic",
+#     "python-dotenv",
 # ]
 # ///
 
@@ -11,8 +12,8 @@ import sys
 import argparse
 import logging
 import json
-import shutil
-from typing import List, Dict, Any
+import importlib.util
+from typing import List, Dict, Any, Callable
 from openai import OpenAI  # type: ignore
 from pydantic import BaseModel  # type: ignore
 from dotenv import load_dotenv
@@ -23,14 +24,14 @@ load_dotenv()
 # -------------------- Logging Setup --------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(message)s",
-    handlers=[logging.FileHandler("agent.log")],
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("agent.log"), logging.StreamHandler(sys.stdout)],
 )
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-# -------------------- Tool Definition --------------------
+# -------------------- Tool Definition (schemas only) --------------------
 class Tool(BaseModel):
     name: str
     description: str
@@ -39,50 +40,41 @@ class Tool(BaseModel):
 
 # -------------------- AI Agent --------------------
 class AIAgent:
-    def __init__(self, api_key: str):
-        # ✔ HuggingFace Inference Router endpoint
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url="https://router.huggingface.co/v1"
-        )
-
+    def __init__(self, api_key: str, tools_dir: str = "tools"):
+        self.client = OpenAI(api_key=api_key, base_url="https://router.huggingface.co/v1")
         self.messages: List[Dict[str, Any]] = []
-        self.tools: List[Tool] = []
-        self._setup_tools()
+        self.tools_dir = tools_dir
 
-    def _setup_tools(self):
+        # tool_name -> loaded python function
+        self.dynamic_tool_functions: Dict[str, Callable[..., str]] = {}
+
+        self._setup_tool_schemas()
+        self._load_dynamic_tools()
+
+    # ----------- Tool Schemas (for LLM visibility only) ------------
+    def _setup_tool_schemas(self):
         self.tools = [
             Tool(
                 name="read_file",
-                description="Read the contents of a file at the specified path",
+                description="Read a file from disk",
                 input_schema={
                     "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path to the file to read",
-                        }
-                    },
+                    "properties": {"path": {"type": "string"}},
                     "required": ["path"],
                 },
             ),
             Tool(
                 name="list_files",
-                description="List all files and directories in the specified path",
+                description="List files in a directory",
                 input_schema={
                     "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The directory path to list (defaults to current directory)",
-                        }
-                    },
+                    "properties": {"path": {"type": "string"}},
                     "required": [],
                 },
             ),
             Tool(
                 name="edit_file",
-                description="Edit a file by replacing old_text with new_text. Creates the file if it doesn't exist.",
+                description="Edit a file, replacing old_text with new_text",
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -95,161 +87,109 @@ class AIAgent:
             ),
             Tool(
                 name="delete_file",
-                description="Delete a file or directory at the specified path",
+                description="Delete a file or directory",
                 input_schema={
                     "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path to the file or directory to delete",
-                        }
-                    },
+                    "properties": {"path": {"type": "string"}},
                     "required": ["path"],
                 },
             ),
             Tool(
                 name="create_directory",
-                description="Create a directory at the specified path",
+                description="Create a directory",
                 input_schema={
                     "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path to the directory to create",
-                        }
-                    },
+                    "properties": {"path": {"type": "string"}},
                     "required": ["path"],
                 },
             ),
             Tool(
                 name="copy_file",
-                description="Copy a file from source to destination",
+                description="Copy file from source to destination",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "source_path": {
-                            "type": "string",
-                            "description": "The path to the source file",
-                        },
-                        "destination_path": {
-                            "type": "string",
-                            "description": "The path to the destination file",
-                        }
+                        "source_path": {"type": "string"},
+                        "destination_path": {"type": "string"},
                     },
                     "required": ["source_path", "destination_path"],
                 },
             ),
             Tool(
                 name="move_file",
-                description="Move or rename a file from source to destination",
+                description="Move or rename a file",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "source_path": {
-                            "type": "string",
-                            "description": "The path to the source file",
-                        },
-                        "destination_path": {
-                            "type": "string",
-                            "description": "The path to the destination file",
-                        }
+                        "source_path": {"type": "string"},
+                        "destination_path": {"type": "string"},
                     },
                     "required": ["source_path", "destination_path"],
                 },
             ),
             Tool(
                 name="search_file",
-                description="Search for files containing specific text",
+                description="Search files for matching text",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "directory": {
-                            "type": "string",
-                            "description": "The directory to search in",
-                        },
-                        "search_text": {
-                            "type": "string",
-                            "description": "The text to search for",
-                        },
-                        "file_extension": {
-                            "type": "string",
-                            "description": "Filter by file extension",
-                        }
+                        "directory": {"type": "string"},
+                        "search_text": {"type": "string"},
+                        "file_extension": {"type": "string"},
                     },
                     "required": ["directory", "search_text"],
                 },
             ),
         ]
 
-    # -------------------- Tool Implementations --------------------
-    def _read_file(self, path: str) -> str:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f"File contents of {path}:\n{f.read()}"
-        except FileNotFoundError:
-            return f"File not found: {path}"
-        except Exception as e:
-            return f"Error reading file: {str(e)}"
+    # ----------- Load tool implementations from /tools/*.py --------
+    def _load_dynamic_tools(self):
+        if not os.path.isdir(self.tools_dir):
+            logging.warning("Tools directory '%s' does not exist.", self.tools_dir)
+            return
 
-    def _list_files(self, path: str) -> str:
-        try:
-            if not os.path.exists(path):
-                return f"Path not found: {path}"
+        for file in sorted(os.listdir(self.tools_dir)):
+            if not file.endswith(".py"):
+                continue
 
-            items = []
-            for item in sorted(os.listdir(path)):
-                prefix = "[DIR]" if os.path.isdir(os.path.join(path, item)) else "[FILE]"
-                items.append(f"{prefix} {item}")
+            module_name = file[:-3]
+            file_path = os.path.join(self.tools_dir, file)
 
-            return f"Contents of {path}:\n" + "\n".join(items)
-        except Exception as e:
-            return f"Error listing files: {str(e)}"
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, file_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except Exception as e:
+                logging.error("Failed to load %s: %s", file, str(e))
+                continue
 
-    def _edit_file(self, path: str, old_text: str, new_text: str) -> str:
-        try:
-            if os.path.exists(path) and old_text:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-
-                if old_text not in content:
-                    return f"Text not found in file: {old_text}"
-
-                content = content.replace(old_text, new_text)
+            if hasattr(module, module_name):
+                func = getattr(module, module_name)
+                if callable(func):
+                    self.dynamic_tool_functions[module_name] = func
+                    logging.info("Loaded tool: %s", module_name)
+                else:
+                    logging.warning("Function %s in %s is not callable", module_name, file)
             else:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                content = new_text
+                logging.warning("File %s has no function '%s'", file, module_name)
 
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-
-            return f"Successfully written to {path}"
-        except Exception as e:
-            return f"Error editing file: {str(e)}"
-
+    # ----------- Execute tool by name -----------
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
-        logging.info(f"Executing tool: {tool_name} with input: {tool_input}")
-        try:
-            if tool_name == "read_file":
-                return self._read_file(tool_input["path"])
-            elif tool_name == "list_files":
-                return self._list_files(tool_input.get("path", "."))
-            elif tool_name == "edit_file":
-                return self._edit_file(
-                    tool_input["path"],
-                    tool_input.get("old_text", ""),
-                    tool_input["new_text"],
-                )
-            else:
-                return f"Unknown tool: {tool_name}"
-        except Exception as e:
-            return f"Error executing {tool_name}: {str(e)}"
+        if tool_name not in self.dynamic_tool_functions:
+            return f"Error: Tool '{tool_name}' is not implemented."
 
-    # -------------------- Chat Loop --------------------
-    def chat(self, user_input: str) -> str:
-        logging.info(f"User input: {user_input}")
+        fn = self.dynamic_tool_functions[tool_name]
+        try:
+            return fn(**tool_input)  # your tools return strings
+        except Exception as e:
+            logging.exception("Tool error")
+            return f"Tool '{tool_name}' failed: {str(e)}"
+
+    # ----------- Chat Loop with tool calling ----------
+    def chat(self, user_input: str, model: str = "deepseek-ai/DeepSeek-V3.2-Exp:novita") -> str:
         self.messages.append({"role": "user", "content": user_input})
 
-        tools = [
+        tools_payload = [
             {
                 "type": "function",
                 "function": {
@@ -262,82 +202,60 @@ class AIAgent:
         ]
 
         while True:
-            try:
-                response = self.client.chat.completions.create(
-                    # ✔ HuggingFace-supported model
-                    model="deepseek-ai/DeepSeek-V3.2-Exp:novita",
-                    messages=self.messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    temperature=0.7,
-                )
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=self.messages,
+                tools=tools_payload,
+                tool_choice="auto",
+            )
 
-                message = response.choices[0].message
-                self.messages.append(message)
+            msg = response.choices[0].message
+            self.messages.append(msg)
 
-                # Tool call?
-                if message.tool_calls:
-                    tool_results = []
-                    for call in message.tool_calls:
-                        name = call.function.name
-                        args = json.loads(call.function.arguments)
-                        result = self._execute_tool(name, args)
-                        tool_results.append({
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": result,
-                        })
+            # Tool-call?
+            if msg.tool_calls:
+                results = []
+                for call in msg.tool_calls:
+                    tool_name = call.function.name
+                    args = json.loads(call.function.arguments or "{}")
+                    output = self._execute_tool(tool_name, args)
+                    results.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": output,
+                    })
+                self.messages.extend(results)
+                continue
 
-                    self.messages.extend(tool_results)
-                    continue
-
-                return message.content or ""
-
-            except Exception as e:
-                return f"Error: {str(e)}"
+            # Final answer
+            return msg.content or ""
 
 
 # -------------------- CLI --------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="AI Code Assistant (HuggingFace Router)"
-    )
-    parser.add_argument(
-        "--api-key", help="HF_TOKEN (or set HF_TOKEN environment variable)"
-    )
+    parser = argparse.ArgumentParser(description="AI Code Assistant (HF Router, Dynamic Tools Only)")
+    parser.add_argument("--api-key", help="HF_TOKEN or environment variable")
+    parser.add_argument("--tools-dir", default="tools", help="Tools folder (default: tools/)")
     args = parser.parse_args()
 
-    api_key = args.api_key or os.getenv("HF_TOKEN")
+    api_key = args.api_key or os.environ.get("HF_TOKEN")
     if not api_key:
-        print("Error: please pass --api-key or set HF_TOKEN environment variable")
+        print("Missing API key. Set HF_TOKEN or pass --api-key")
         sys.exit(1)
 
-    agent = AIAgent(api_key)
+    agent = AIAgent(api_key=api_key, tools_dir=args.tools_dir)
 
-    print("AI Code Assistant (HuggingFace Router)")
-    print("=====================================")
-    print("Type 'exit' or 'quit' to end.\n")
+    print("AI Code Assistant — HuggingFace Router")
+    print("Dynamic Tool Loader (no built-in tools)")
+    print("----------------------------------------")
 
     while True:
-        try:
-            user_input = input("You: ").strip()
-            if user_input.lower() in ["exit", "quit"]:
-                print("Goodbye!")
-                break
-
-            if not user_input:
-                continue
-
-            print("\nAssistant: ", end="", flush=True)
-            response = agent.chat(user_input)
-            print(response)
-            print()
-
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
+        user_input = input("You: ").strip()
+        if user_input.lower() in ("exit", "quit"):
+            print("Goodbye!")
             break
-        except Exception as e:
-            print(f"\nError: {str(e)}\n")
+        response = agent.chat(user_input)
+        print("Assistant:", response)
 
 
 if __name__ == "__main__":
